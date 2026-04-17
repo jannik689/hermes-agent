@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎮 游戏乐园 - 免费在线小游戏</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header class="header">
+        <div class="container">
+            <h1 class="logo">🎮 游戏乐园</h1>
+            <nav class="nav">
+                <a href="#" class="nav-link active">首页</a>
+                <a href="#games" class="nav-link">游戏列表</a>
+                <a href="#about" class="nav-link">关于我们</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="main">
+        <section class="hero">
+            <div class="container">
+                <h2>欢迎来到游戏乐园！</h2>
+                <p>免费在线畅玩经典小游戏，无需下载，即开即玩</p>
+            </div>
+        </section>
+
+        <section id="games" class="games-section">
+            <div class="container">
+                <h2 class="section-title">🎯 热门游戏</h2>
+                <div class="games-grid">
+                    <div class="game-card" data-game="snake">
+                        <div class="game-icon">🐍</div>
+                        <h3>贪吃蛇</h3>
+                        <p>经典贪吃蛇游戏，控制蛇吃掉食物变长</p>
+                        <button class="play-btn">开始游戏</button>
+                    </div>
+                    <div class="game-card" data-game="tetris">
+                        <div class="game-icon">🧱</div>
+                        <h3>俄罗斯方块</h3>
+                        <p>经典方块消除游戏，考验你的反应能力</p>
+                        <button class="play-btn">开始游戏</button>
+                    </div>
+                    <div class="game-card" data-game="breakout">
+                        <div class="game-icon">🏓</div>
+                        <h3>打砖块</h3>
+                        <p>控制挡板弹球，消除所有砖块</p>
+                        <button class="play-btn">开始游戏</button>
+                    </div>
+                    <div class="game-card" data-game="memory">
+                        <div class="game-icon">🎴</div>
+                        <h3>记忆配对</h3>
+                        <p>翻牌配对游戏，锻炼你的记忆力</p>
+                        <button class="play-btn">开始游戏</button>
+                    </div>
+                    <div class="game-card" data-game="clicker">
+                        <div class="game-icon">⚡</div>
+                        <h3>手速挑战</h3>
+                        <p>测试你的手速，看看能点多快</p>
+                        <button class="play-btn">开始游戏</button>
+                    </div>
+                    <div class="game-card" data-game="guess">
+                        <div class="game-icon">❓</div>
+                        <h3>猜数字</h3>
+                        <p>猜出计算机生成的随机数字</p>
+                        <button class="play-btn">开始游戏</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="about" class="about-section">
+            <div class="container">
+                <h2 class="section-title">📖 关于我们</h2>
+                <div class="about-content">
+                    <p>游戏乐园是一个免费在线小游戏平台，提供多种经典游戏供您娱乐。</p>
+                    <p>我们的特点：</p>
+                    <ul class="features-list">
+                        <li>✅ 完全免费，无需注册</li>
+                        <li>✅ 无需下载，即开即玩</li>
+                        <li>✅ 响应式设计，支持手机和电脑</li>
+                        <li>✅ 持续更新新游戏</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <div class="container">
+            <p>&copy; 2024 游戏乐园。All rights reserved.</p>
+        </div>
+    </footer>
+
+    <!-- 游戏模态框 -->
+    <div id="gameModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="gameTitle">游戏名称</h3>
+                <button class="close-btn" id="closeModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="gameContainer"></div>
+                <div id="gameControls" class="game-controls"></div>
+                <div id="gameScore" class="game-score"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="games.js"></script>
+</body>
+</html>

@@ -10791,19 +10791,25 @@ class AIAgent:
 
         return result
 
-    def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+    def chat(self, message: str, stream_callback: Optional[callable] = None, conversation_history: Optional[List[Dict[str, Any]]] = None) -> str:
         """
         Simple chat interface that returns just the final response.
 
         Args:
             message (str): User message
             stream_callback: Optional callback invoked with each text delta during streaming.
+            conversation_history: Optional list of previous messages to seed context.
 
         Returns:
             str: Final assistant response
         """
-        result = self.run_conversation(message, stream_callback=stream_callback)
-        return result["final_response"]
+        result = self.run_conversation(message, stream_callback=stream_callback, conversation_history=conversation_history)
+        if "final_response" in result and result["final_response"] is not None:
+            return result["final_response"]
+        elif "error" in result:
+            return f"Error: {result['error']}"
+        else:
+            return "Error: Unknown execution failure (no final_response returned)"
 
 
 def main(

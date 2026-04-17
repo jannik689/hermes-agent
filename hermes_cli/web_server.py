@@ -49,7 +49,7 @@ from gateway.status import get_running_pid, read_runtime_status
 try:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -93,6 +93,7 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/status",
+    "/api/session-token",
     "/api/config/defaults",
     "/api/config/schema",
     "/api/model/info",
@@ -114,8 +115,17 @@ def _require_token(request: Request) -> None:
 async def auth_middleware(request: Request, call_next):
     """Require the session token on all /api/ routes except the public list."""
     path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
+    if (
+        path.startswith("/api/")
+        and path not in _PUBLIC_API_PATHS
+        and not path.startswith("/api/v1/demo/")
+    ):
         auth = request.headers.get("authorization", "")
+        if not auth:
+            token = request.query_params.get("token", "")
+            if token:
+                auth = f"Bearer {token}"
+        
         expected = f"Bearer {_SESSION_TOKEN}"
         if not hmac.compare_digest(auth.encode(), expected.encode()):
             return JSONResponse(
@@ -123,6 +133,871 @@ async def auth_middleware(request: Request, call_next):
                 content={"detail": "Unauthorized"},
             )
     return await call_next(request)
+
+
+class _DemoRunCreate(BaseModel):
+    prompt: str
+    sessionId: Optional[str] = None
+    mode: Optional[str] = "plan"
+
+
+class _DemoApprovalDecision(BaseModel):
+    decision: str
+
+
+_demo_runs: Dict[str, Dict[str, Any]] = {}
+
+
+def _demo_emit(run_id: str, event: Dict[str, Any]) -> None:
+    run = _demo_runs.get(run_id)
+    if not run:
+        return
+    run["events"].append(event)
+    run["queue"].put_nowait(event)
+
+
+async def _demo_worker(run_id: str, prompt: str) -> None:
+    run = _demo_runs.get(run_id)
+    if not run:
+        return
+
+    def _evt(t: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        run["seq"] += 1
+        return {"id": f"evt_{run['seq']:06d}", "ts": int(time.time() * 1000), "type": t, "payload": payload}
+
+    _demo_emit(run_id, _evt("run.created", {"runId": run_id, "prompt": prompt}))
+    _demo_emit(run_id, _evt("run.updated", {"runId": run_id, "status": "running"}))
+
+    steps = [
+        {"id": "s1", "name": "解析需求"},
+        {"id": "s2", "name": "选择技能"},
+        {"id": "s3", "name": "执行技能"},
+        {"id": "s4", "name": "整理输出"},
+    ]
+
+    for step in steps:
+        if run.get("cancelled"):
+            _demo_emit(run_id, _evt("run.updated", {"runId": run_id, "status": "cancelled"}))
+            _demo_emit(run_id, _evt("run.finished", {"runId": run_id, "status": "cancelled"}))
+            run["done"] = True
+            return
+
+        _demo_emit(
+            run_id,
+            _evt(
+                "run.step.created",
+                {"runId": run_id, "step": {**step, "status": "queued"}},
+            ),
+        )
+        await asyncio.sleep(0.25)
+
+        if step["id"] == "s3":
+            approval_id = f"ap_{secrets.token_hex(6)}"
+            gate = asyncio.Event()
+            run["approvals"][approval_id] = {"id": approval_id, "decision": None, "event": gate}
+
+            _demo_emit(run_id, _evt("run.updated", {"runId": run_id, "status": "blocked"}))
+            _demo_emit(
+                run_id,
+                _evt(
+                    "run.step.updated",
+                    {"runId": run_id, "step": {**step, "status": "blocked"}},
+                ),
+            )
+            _demo_emit(
+                run_id,
+                _evt(
+                    "approval.requested",
+                    {
+                        "runId": run_id,
+                        "approvalId": approval_id,
+                        "scope": "fs_write",
+                        "reason": "需要写入本地文件（demo）",
+                        "proposal": {"path": "notes.md", "preview": "写入 3 条行动项…"},
+                    },
+                ),
+            )
+
+            while True:
+                if run.get("cancelled"):
+                    _demo_emit(run_id, _evt("run.updated", {"runId": run_id, "status": "cancelled"}))
+                    _demo_emit(run_id, _evt("run.finished", {"runId": run_id, "status": "cancelled"}))
+                    run["done"] = True
+                    return
+                try:
+                    await asyncio.wait_for(gate.wait(), timeout=1.0)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+            decision = run["approvals"][approval_id]["decision"]
+            _demo_emit(
+                run_id,
+                _evt(
+                    "approval.decided",
+                    {"runId": run_id, "approvalId": approval_id, "decision": decision},
+                ),
+            )
+            if decision != "approved":
+                _demo_emit(run_id, _evt("run.updated", {"runId": run_id, "status": "failed"}))
+                _demo_emit(
+                    run_id,
+                    _evt(
+                        "run.finished",
+                        {
+                            "runId": run_id,
+                            "status": "failed",
+                            "finalText": "审批被拒绝，执行已停止。",
+                        },
+                    ),
+                )
+                run["done"] = True
+                return
+
+            _demo_emit(run_id, _evt("run.updated", {"runId": run_id, "status": "running"}))
+
+        _demo_emit(
+            run_id,
+            _evt(
+                "run.step.updated",
+                {"runId": run_id, "step": {**step, "status": "running"}},
+            ),
+        )
+
+        _demo_emit(
+            run_id,
+            _evt(
+                "run.log.appended",
+                {"runId": run_id, "stepId": step["id"], "log": {"level": "info", "message": f"{step['name']}…"}},
+            ),
+        )
+
+        await asyncio.sleep(0.55)
+
+        _demo_emit(
+            run_id,
+            _evt(
+                "run.step.updated",
+                {
+                    "runId": run_id,
+                    "step": {
+                        **step,
+                        "status": "succeeded",
+                        "output": {"preview": f"{step['name']}完成"},
+                    },
+                },
+            ),
+        )
+
+    _demo_emit(
+        run_id,
+        _evt(
+            "run.artifact.created",
+            {
+                "runId": run_id,
+                "artifact": {
+                    "id": f"af_{secrets.token_hex(6)}",
+                    "type": "file",
+                    "title": "notes.md",
+                    "uri": "file://notes.md",
+                },
+            },
+        ),
+    )
+
+    _demo_emit(
+        run_id,
+        _evt(
+            "run.updated",
+            {"runId": run_id, "status": "succeeded"},
+        ),
+    )
+
+    _demo_emit(
+        run_id,
+        _evt(
+            "run.finished",
+            {
+                "runId": run_id,
+                "status": "succeeded",
+                "finalText": f"已完成：{prompt}\n\n- 行动项 1\n- 行动项 2\n- 行动项 3",
+            },
+        ),
+    )
+    run["done"] = True
+
+
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+_run_executor = ThreadPoolExecutor(max_workers=10)
+
+def _real_worker_sync(run_id: str, prompt: str, loop: asyncio.AbstractEventLoop, session_id: str = None, mode: str = "plan") -> None:
+    print(f"[{run_id}] _real_worker_sync started, prompt: {prompt[:50]}...", flush=True)
+    
+    import time
+    import traceback
+    run = _demo_runs.get(run_id)
+    if not run:
+        print(f"[{run_id}] Run dict not found!", flush=True)
+        return
+
+    def _evt(t: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        run["seq"] += 1
+        return {"id": f"evt_{run['seq']:06d}", "ts": int(time.time() * 1000), "type": t, "payload": payload}
+
+    def emit(event: Dict[str, Any]) -> None:
+        print(f"[{run_id}] EMIT {event['type']}", flush=True)
+        run["events"].append(event)
+        loop.call_soon_threadsafe(run["queue"].put_nowait, event)
+
+    try:
+        emit(_evt("run.created", {"runId": run_id, "prompt": prompt}))
+        emit(_evt("run.updated", {"runId": run_id, "status": "running"}))
+
+        import secrets
+        from run_agent import AIAgent
+        from hermes_cli.config import load_config
+        
+        config = load_config()
+        from hermes_cli.models import _PROVIDER_ALIASES
+        model_cfg = config.get("model")
+
+        req_provider = ""
+        req_model = ""
+        if isinstance(model_cfg, dict):
+            req_provider = str(model_cfg.get("provider") or "").strip().lower()
+            req_model = str(model_cfg.get("default") or "").strip()
+        elif isinstance(model_cfg, str):
+            req_model = model_cfg.strip()
+
+        if not req_model:
+            req_provider = "anthropic"
+            req_model = "claude-3-haiku-20240307"
+
+        if not req_provider:
+            if "/" in req_model:
+                req_provider = "openrouter"
+            else:
+                req_provider = "auto"
+
+        req_provider = _PROVIDER_ALIASES.get(req_provider, req_provider)
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        print(f"[{run_id}] Resolving provider: {req_provider}", flush=True)
+        runtime = resolve_runtime_provider(requested=req_provider)
+        if not runtime:
+            print(f"[{run_id}] Provider resolve failed for: {req_provider}", flush=True)
+            emit(_evt("run.updated", {"runId": run_id, "status": "failed"}))
+            emit(_evt("run.finished", {"runId": run_id, "status": "failed", "finalText": f"执行失败: 无法解析提供商配置 {req_provider}"}))
+            run["done"] = True
+            return
+            
+        provider = runtime.get("provider", "")
+        api_mode = runtime.get("api_mode", "chat_completions")
+        base_url = runtime.get("base_url", "")
+        api_key = runtime.get("api_key", "")
+        print(f"[{run_id}] Provider resolved: {provider}, model: {req_model}", flush=True)
+        
+        # We will build callbacks to hook into AIAgent
+        def on_tool_start(tool_id: str, name: str, args: dict):
+            print(f"[{run_id}] TOOL START: {name}", flush=True)
+            step_id = tool_id or f"step_{secrets.token_hex(4)}"
+            step = {"id": step_id, "name": f"调用工具 {name}", "status": "running"}
+            emit(_evt("run.step.created", {"runId": run_id, "step": step}))
+            if "_steps" not in run:
+                run["_steps"] = {}
+            run["_steps"][name] = step_id
+            run["_steps"][tool_id] = step_id
+
+        def on_tool_progress(event_type: str, tool_name: str, preview: str, args: dict = None):
+            step_id = run.get("_steps", {}).get(tool_name)
+            if not step_id:
+                return
+            emit(_evt("run.log.appended", {
+                "runId": run_id, 
+                "stepId": step_id, 
+                "log": {"level": "info", "message": str(preview)[:500]}
+            }))
+
+        def on_tool_complete(tool_id: str, name: str, args: dict, result: Any):
+            print(f"[{run_id}] TOOL COMPLETE: {name}", flush=True)
+            step_id = run.get("_steps", {}).get(name) or tool_id
+            step = {"id": step_id, "name": f"调用工具 {name}", "status": "succeeded", "output": {"preview": "执行完毕"}}
+            emit(_evt("run.step.updated", {"runId": run_id, "step": step}))
+            if name in run.get("_steps", {}):
+                del run["_steps"][name]
+
+        # Add thinking and reasoning callbacks to capture thinking process
+        def on_thinking(message: str):
+            # If message is empty, it means thinking is done
+            if not message and "step_thinking_current" in run.get("_steps", {}):
+                step_id = run["_steps"]["step_thinking_current"]
+                step = {"id": step_id, "name": "思考", "status": "succeeded"}
+                emit(_evt("run.step.updated", {"runId": run_id, "step": step}))
+                del run["_steps"]["step_thinking_current"]
+                return
+
+            # Ignore empty messages if no active thinking step
+            if not message:
+                return
+
+            # Use a special step id for thinking so we can append to it
+            if "step_thinking_current" not in run.get("_steps", {}):
+                step_id = f"step_thinking_{secrets.token_hex(4)}"
+                if "_steps" not in run:
+                    run["_steps"] = {}
+                run["_steps"]["step_thinking_current"] = step_id
+                step = {"id": step_id, "name": "思考", "status": "running"}
+                emit(_evt("run.step.created", {"runId": run_id, "step": step}))
+            else:
+                step_id = run["_steps"]["step_thinking_current"]
+            
+            emit(_evt("run.log.appended", {
+                "runId": run_id, 
+                "stepId": step_id, 
+                "log": {"level": "info", "message": message}
+            }))
+
+        def on_reasoning(text: str):
+            on_thinking(text)
+
+        # Approval Hook
+        from tools.approval import set_current_session_key, register_gateway_notify, unregister_gateway_notify, resolve_gateway_approval
+        set_current_session_key(run_id)
+
+        def on_approval_request(approval_data: dict):
+            print(f"[{run_id}] APPROVAL REQUESTED", flush=True)
+            approval_id = f"ap_{secrets.token_hex(6)}"
+            run["approvals"][approval_id] = {
+                "id": approval_id, 
+                "decision": None, 
+            }
+            run["approvals"][approval_id]["run_id"] = run_id
+            
+            emit(_evt("run.updated", {"runId": run_id, "status": "blocked"}))
+            
+            emit(_evt("approval.requested", {
+                "runId": run_id,
+                "approvalId": approval_id,
+                "scope": "terminal_command",
+                "reason": approval_data.get("description", "Dangerous command detected"),
+                "proposal": {"path": "Command", "preview": approval_data.get("command", "")},
+            }))
+
+        register_gateway_notify(run_id, on_approval_request)
+
+        agent_kwargs = {
+            "model": req_model,
+            "provider": provider,
+            "api_mode": api_mode,
+            "api_key": api_key,
+            "base_url": base_url,
+            "session_id": session_id,
+            "tool_start_callback": on_tool_start,
+            "tool_progress_callback": on_tool_progress,
+            "tool_complete_callback": on_tool_complete,
+            "thinking_callback": on_thinking,
+            "reasoning_callback": on_reasoning,
+            "save_trajectories": False,
+            "quiet_mode": True
+        }
+
+        if mode == "chat":
+            print(f"[{run_id}] Chat mode enabled. Disabling tools.", flush=True)
+            agent_kwargs["enabled_toolsets"] = []
+            agent_kwargs["max_iterations"] = 1
+
+        print(f"[{run_id}] Initializing AIAgent...", flush=True)
+        agent = AIAgent(**agent_kwargs)
+
+        print(f"[{run_id}] Agent chat started...", flush=True)
+        
+        def on_stream(delta: str):
+            # Send the incremental delta to the frontend
+            emit(_evt("run.chunk", {"runId": run_id, "chunk": delta}))
+            
+        # Load conversation history
+        conversation_history = []
+        if session_id:
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB()
+                history = db.get_messages_as_conversation(session_id)
+                if history:
+                    # Filter out session_meta and other non-standard roles
+                    conversation_history = [m for m in history if m.get("role") != "session_meta"]
+                    print(f"[{run_id}] Loaded {len(conversation_history)} past messages for session {session_id}", flush=True)
+            except Exception as e:
+                print(f"[{run_id}] Failed to load session history: {e}", flush=True)
+
+        final_text = agent.chat(prompt, stream_callback=on_stream, conversation_history=conversation_history)
+        print(f"[{run_id}] Agent chat finished. Result length: {len(final_text)}", flush=True)
+        
+        emit(_evt("run.updated", {"runId": run_id, "status": "succeeded"}))
+        emit(_evt("run.finished", {
+            "runId": run_id,
+            "status": "succeeded",
+            "finalText": final_text
+        }))
+    except Exception as e:
+        print(f"[{run_id}] ERROR in _real_worker_sync: {e}", flush=True)
+        traceback.print_exc()
+        emit(_evt("run.updated", {"runId": run_id, "status": "failed"}))
+        emit(_evt("run.finished", {
+            "runId": run_id,
+            "status": "failed",
+            "finalText": f"执行失败: {str(e)}"
+        }))
+    finally:
+        try:
+            from tools.approval import unregister_gateway_notify
+            unregister_gateway_notify(run_id)
+        except Exception as e:
+            print(f"[{run_id}] ERROR unregistering notify: {e}", flush=True)
+        run["done"] = True
+        print(f"[{run_id}] Worker sync done.", flush=True)
+
+async def _real_worker(run_id: str, prompt: str, session_id: str = None, mode: str = "plan") -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_run_executor, _real_worker_sync, run_id, prompt, loop, session_id, mode)
+
+@app.post("/api/v1/runs")
+async def create_run(body: _DemoRunCreate):
+    print(f"POST /api/v1/runs called with prompt: {body.prompt[:20]}, sessionId: {body.sessionId}, mode: {body.mode}", flush=True)
+    run_id = f"run_{secrets.token_hex(8)}"
+    _demo_runs[run_id] = {
+        "id": run_id,
+        "created_at": time.time(),
+        "queue": asyncio.Queue(),
+        "events": [],
+        "seq": 0,
+        "done": False,
+        "approvals": {},
+        "cancelled": False,
+        "_steps": {},
+    }
+    asyncio.create_task(_real_worker(run_id, body.prompt, body.sessionId, body.mode))
+    return {"id": run_id, "status": "running", "createdAt": int(time.time() * 1000)}
+
+@app.get("/api/v1/runs/{run_id}/events")
+async def run_events(run_id: str, request: Request):
+    print(f"GET /api/v1/runs/{run_id}/events called", flush=True)
+    run = _demo_runs.get(run_id)
+    if not run:
+        print(f"GET events: Run {run_id} not found", flush=True)
+        raise HTTPException(status_code=404)
+
+    async def event_generator():
+        print(f"GET events: generator started for {run_id}", flush=True)
+        
+        # Send already stored events that might have been popped from the queue
+        # Wait, to avoid duplication and lost events, we just consume the queue.
+        # But if the generator restarts, it needs past events.
+        # For simplicity, we just send everything from the queue until it's empty and done.
+        
+        # We need an index to know which events we've sent
+        last_idx = 0
+        
+        while True:
+            if await request.is_disconnected():
+                print(f"GET events: client disconnected for {run_id}", flush=True)
+                break
+                
+            # Send any events we haven't sent yet from the list
+            while last_idx < len(run["events"]):
+                evt = run["events"][last_idx]
+                yield f"event: {evt['type']}\ndata: {json.dumps(evt)}\n\n"
+                last_idx += 1
+                
+            if run["done"] and last_idx >= len(run["events"]):
+                break
+                
+            try:
+                # We just wait for new events to be added to the list
+                # Since emit appends to the list, we can just sleep a bit
+                await asyncio.sleep(0.1)
+            except Exception:
+                break
+                
+        print(f"GET events: generator done for {run_id}", flush=True)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.post("/api/v1/runs/{run_id}/cancel")
+async def cancel_run(run_id: str):
+    run = _demo_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404)
+    run["cancelled"] = True
+    return {"ok": True}
+
+@app.post("/api/v1/approvals/{approval_id}/decision")
+async def run_approval_decision(approval_id: str, body: _DemoApprovalDecision):
+    # we need to find which run has this approval
+    for run_id, run in _demo_runs.items():
+        if approval_id in run.get("approvals", {}):
+            approval = run["approvals"][approval_id]
+            approval["decision"] = body.decision
+            if "event" in approval:
+                # set threadsafe? Actually this is async, so event.set() is fine if event is asyncio.Event
+                # wait, if event is threading.Event, we just set it
+                if hasattr(approval["event"], "set_result"):
+                    # it's a future or asyncio object maybe?
+                    approval["event"].set()
+                else:
+                    # assuming threading.Event
+                    approval["event"].set()
+            else:
+                # Real worker approval
+                from tools.approval import resolve_gateway_approval
+                # map body.decision to 'approved' / 'denied' (or once/session/always)
+                choice = "once" if body.decision == "approved" else "deny"
+                resolve_gateway_approval(run_id, choice)
+                # We should emit run.updated status running
+                run["queue"].put_nowait({"id": f"evt_{run['seq']:06d}", "ts": int(time.time() * 1000), "type": "run.updated", "payload": {"runId": run_id, "status": "running"}})
+                run["events"].append({"id": f"evt_{run['seq']:06d}", "ts": int(time.time() * 1000), "type": "run.updated", "payload": {"runId": run_id, "status": "running"}})
+            return {"ok": True}
+    raise HTTPException(status_code=404)
+
+@app.get("/api/settings/models")
+async def get_models_settings():
+    from hermes_cli.auth import PROVIDER_REGISTRY, get_auth_status
+    from hermes_cli.config import load_config, load_env
+    from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_ALIASES, get_default_model_for_provider
+
+    config = load_config()
+    env = load_env()
+
+    model_cfg = config.get("model")
+    active_provider = ""
+    active_model = ""
+    if isinstance(model_cfg, dict):
+        active_provider = str(model_cfg.get("provider") or "").strip()
+        active_model = str(model_cfg.get("default") or "").strip()
+    elif isinstance(model_cfg, str):
+        active_model = model_cfg.strip()
+
+    provider_models = config.get("provider_models")
+    if not isinstance(provider_models, dict):
+        provider_models = {}
+
+    providers = []
+    for p in CANONICAL_PROVIDERS:
+        pid = p.slug
+        pconfig = PROVIDER_REGISTRY.get(pid)
+        api_key_set = False
+        base_url = ""
+        url_env = ""
+        key_env = ""
+        if pconfig:
+            base_url = str(env.get(pconfig.base_url_env_var or "", "") or "").strip()
+            url_env = str(pconfig.base_url_env_var or "")
+            if pconfig.auth_type == "api_key":
+                key_env = str(pconfig.api_key_env_vars[0]) if pconfig.api_key_env_vars else ""
+                api_key_set = any(bool(str(env.get(k, "") or "").strip()) for k in pconfig.api_key_env_vars)
+            else:
+                try:
+                    status = get_auth_status(pid)
+                    api_key_set = bool(status.get("logged_in"))
+                except Exception:
+                    api_key_set = False
+        default_model = str(provider_models.get(pid) or "") or get_default_model_for_provider(pid)
+        providers.append(
+            {
+                "id": pid,
+                "name": p.label,
+                "isCustom": False,
+                "apiKeySet": api_key_set,
+                "baseUrl": base_url,
+                "keyEnv": key_env,
+                "urlEnv": url_env,
+                "defaultModel": default_model,
+            }
+        )
+
+    customs = config.get("providers", {})
+    if isinstance(customs, dict):
+        for pid, pdata in customs.items():
+            providers.append(
+                {
+                    "id": pid,
+                    "name": pdata.get("name", pid),
+                    "isCustom": True,
+                    "apiKeySet": bool(str(pdata.get("api_key") or "").strip()),
+                    "baseUrl": pdata.get("api", ""),
+                    "defaultModel": pdata.get("default_model", ""),
+                    "transport": pdata.get("transport", "openai"),
+                }
+            )
+
+    canonical_active_provider = str(active_provider or "").strip().lower()
+    canonical_active_provider = _PROVIDER_ALIASES.get(canonical_active_provider, canonical_active_provider)
+
+    return {
+        "activeProvider": canonical_active_provider,
+        "activeModel": active_model,
+        "providers": providers,
+    }
+
+class ProviderUpdate(BaseModel):
+    id: str
+    isCustom: bool
+    name: str = ""
+    apiKey: str = ""
+    baseUrl: str = ""
+    defaultModel: str = ""
+    transport: str = "openai"
+
+@app.post("/api/settings/providers")
+async def update_provider(body: ProviderUpdate):
+    from hermes_cli.auth import PROVIDER_REGISTRY
+    from hermes_cli.config import load_config, save_config, save_env_value
+    from hermes_cli.models import _PROVIDER_ALIASES
+    import secrets
+
+    if not body.isCustom:
+        pid = str(body.id or "").strip().lower()
+        pid = _PROVIDER_ALIASES.get(pid, pid)
+        pconfig = PROVIDER_REGISTRY.get(pid)
+        if not pconfig:
+            raise HTTPException(status_code=404, detail="Built-in provider not found")
+
+        if body.apiKey and body.apiKey != "********":
+            if pconfig.api_key_env_vars:
+                save_env_value(pconfig.api_key_env_vars[0], body.apiKey)
+
+        if pconfig.base_url_env_var and body.baseUrl is not None:
+            save_env_value(pconfig.base_url_env_var, body.baseUrl)
+
+        config = load_config()
+        provider_models = config.get("provider_models")
+        if not isinstance(provider_models, dict):
+            provider_models = {}
+        if body.defaultModel is not None:
+            provider_models[pid] = body.defaultModel
+        config["provider_models"] = provider_models
+        save_config(config)
+
+        return {"ok": True}
+    else:
+        config = load_config()
+        if "providers" not in config or not isinstance(config["providers"], dict):
+            config["providers"] = {}
+            
+        pid = body.id or f"custom-{secrets.token_hex(4)}"
+        
+        # If it exists, update it
+        existing = config["providers"].get(pid, {})
+        
+        api_key = body.apiKey
+        if api_key == "********":
+            api_key = existing.get("api_key", "")
+            
+        config["providers"][pid] = {
+            "name": body.name or pid,
+            "api": body.baseUrl,
+            "api_key": api_key,
+            "default_model": body.defaultModel,
+            "transport": body.transport
+        }
+        
+        save_config(config)
+        return {"ok": True, "id": pid}
+
+@app.delete("/api/settings/providers/{provider_id}")
+async def delete_provider(provider_id: str):
+    from hermes_cli.config import load_config, save_config
+    config = load_config()
+    if "providers" in config and isinstance(config["providers"], dict):
+        if provider_id in config["providers"]:
+            del config["providers"][provider_id]
+            save_config(config)
+            return {"ok": True}
+    raise HTTPException(status_code=404, detail="Custom provider not found")
+
+class ActiveModelUpdate(BaseModel):
+    provider: str | None = None
+    model: str
+
+@app.put("/api/settings/active_model")
+async def update_active_model(body: ActiveModelUpdate):
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.models import _PROVIDER_ALIASES
+    
+    config = load_config()
+    
+    pid = str(body.provider or "").strip().lower()
+    model_name = body.model
+    if not pid and "/" in model_name:
+        pid, model_name = model_name.split("/", 1)
+        
+    pid = _PROVIDER_ALIASES.get(pid, pid)
+    
+    if pid:
+        config["model"] = {"provider": pid, "default": model_name}
+    else:
+        config["model"] = model_name
+        
+    provider_models = config.get("provider_models")
+    if not isinstance(provider_models, dict):
+        provider_models = {}
+    if pid:
+        provider_models[pid] = model_name
+        config["provider_models"] = provider_models
+        
+    save_config(config)
+    return {"ok": True}
+
+class ProviderTestRequest(BaseModel):
+    model: str = ""
+
+@app.post("/api/settings/providers/{provider_id}/test")
+async def test_provider_connectivity(provider_id: str, body: ProviderTestRequest | None = None):
+    from hermes_cli.models import _PROVIDER_ALIASES, get_default_model_for_provider
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.config import load_config
+
+    pid = str(provider_id or "").strip().lower()
+    pid = _PROVIDER_ALIASES.get(pid, pid)
+    runtime = resolve_runtime_provider(requested=pid)
+
+    base_url = str(runtime.get("base_url") or "").strip().rstrip("/")
+    api_key = str(runtime.get("api_key") or "").strip()
+    api_mode = str(runtime.get("api_mode") or "chat_completions").strip()
+
+    cfg = load_config()
+    provider_models = cfg.get("provider_models")
+    if not isinstance(provider_models, dict):
+        provider_models = {}
+    model = ""
+    if body and isinstance(body.model, str) and body.model.strip():
+        model = body.model.strip()
+    else:
+        model = str(provider_models.get(pid) or "").strip() or get_default_model_for_provider(pid)
+
+    try:
+        import urllib.error
+        if api_mode == "anthropic_messages":
+            import urllib.request
+            payload = json.dumps(
+                {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}
+            ).encode()
+            req = urllib.request.Request(
+                base_url + "/v1/messages",
+                data=payload,
+                headers={
+                    "content-type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if 200 <= resp.status < 300:
+                    return {"ok": True, "message": "连接成功"}
+                raise HTTPException(status_code=400, detail=f"连接失败: HTTP {resp.status}")
+        else:
+            import urllib.request
+
+            url = base_url
+            if not url.endswith("/v1") and "/v1/" not in url:
+                url = url + "/v1"
+            url = url + "/chat/completions"
+            payload = json.dumps(
+                {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}
+            ).encode()
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"authorization": f"Bearer {api_key}", "content-type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if 200 <= resp.status < 300:
+                    return {"ok": True, "message": "连接成功"}
+                raise HTTPException(status_code=400, detail=f"连接失败: HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            detail = str(e)
+        raise HTTPException(status_code=400, detail=detail)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+
+
+@app.post("/api/v1/demo/runs")
+async def demo_create_run(body: _DemoRunCreate):
+    run_id = f"demo_{secrets.token_hex(8)}"
+    _demo_runs[run_id] = {
+        "id": run_id,
+        "created_at": time.time(),
+        "queue": asyncio.Queue(),
+        "events": [],
+        "seq": 0,
+        "done": False,
+        "cancelled": False,
+        "approvals": {},
+    }
+    asyncio.create_task(_demo_worker(run_id, body.prompt))
+    return {"runId": run_id}
+
+
+@app.post("/api/v1/demo/runs/{run_id}/cancel")
+async def demo_cancel_run(run_id: str):
+    run = _demo_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    run["cancelled"] = True
+    for a in run.get("approvals", {}).values():
+        ev = a.get("event")
+        if ev:
+            ev.set()
+    return {"ok": True}
+
+
+@app.post("/api/v1/demo/approvals/{approval_id}/decision")
+async def demo_approval_decision(approval_id: str, body: _DemoApprovalDecision):
+    decision = body.decision
+    if decision not in ("approved", "denied"):
+        raise HTTPException(status_code=400, detail="Invalid decision")
+
+    for run in _demo_runs.values():
+        approval = run.get("approvals", {}).get(approval_id)
+        if approval:
+            approval["decision"] = decision
+            ev = approval.get("event")
+            if ev:
+                ev.set()
+            return {"ok": True}
+
+    raise HTTPException(status_code=404, detail="Approval not found")
+
+
+@app.get("/api/v1/demo/runs/{run_id}/events")
+async def demo_run_events(run_id: str):
+    run = _demo_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    async def gen():
+        for ev in run["events"]:
+            yield f"id: {ev['id']}\nevent: {ev['type']}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        while True:
+            if run["done"] and run["queue"].empty():
+                break
+            try:
+                ev = await asyncio.wait_for(run["queue"].get(), timeout=15.0)
+            except asyncio.TimeoutError:
+                yield b": keepalive\n\n"
+                continue
+            yield f"id: {ev['id']}\nevent: {ev['type']}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +1340,11 @@ async def get_status():
     }
 
 
+@app.get("/api/session-token")
+async def get_session_token():
+    return {"token": _SESSION_TOKEN}
+
+
 @app.get("/api/sessions")
 async def get_sessions(limit: int = 20, offset: int = 0):
     try:
@@ -475,6 +1355,7 @@ async def get_sessions(limit: int = 20, offset: int = 0):
             total = db.session_count()
             now = time.time()
             for s in sessions:
+                s["id"] = s["session_id"]
                 s["is_active"] = (
                     s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
@@ -1874,6 +2755,68 @@ async def delete_cron_job(job_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Experts endpoint (Mock Data)
+# ---------------------------------------------------------------------------
+
+_MOCK_EXPERTS = [
+    # 设计 (design)
+    {"id": "e_d1", "name": "UI/UX 设计专家", "category": "design", "tag": "界面设计", "description": "请作为一名拥有10年经验的UI/UX设计专家，为我评估当前的产品界面并提供至少3条改进转化率的设计建议。"},
+    {"id": "e_d2", "name": "品牌视觉顾问", "category": "design", "tag": "品牌", "description": "请扮演资深品牌视觉设计师，根据我提供的产品定位，构思一套完整的品牌色彩规范与排版指南。"},
+    {"id": "e_d3", "name": "交互动效导师", "category": "design", "tag": "动效", "description": "作为交互动效专家，请为我的移动端App设计流畅的页面切换与按钮点击反馈，要求提升用户的操作沉浸感。"},
+    {"id": "e_d4", "name": "海报排版大师", "category": "design", "tag": "平面设计", "description": "请扮演专业平面设计师，为即将到来的促销活动设计一张海报的视觉层级结构和文案排版布局。"},
+    {"id": "e_d5", "name": "设计系统架构师", "category": "design", "tag": "Design System", "description": "作为设计系统架构师，请帮我规划一套适用于React项目的Design System组件库规范，包含色彩、间距和基础组件。"},
+    {"id": "e_d6", "name": "用户体验研究员", "category": "design", "tag": "UX研究", "description": "请作为UX研究员，为我的新产品设计一份完整的用户访谈问卷，以挖掘目标用户的核心痛点和使用场景。"},
+
+    # 工程技术 (engineering)
+    {"id": "e_e1", "name": "资深前端架构师", "category": "engineering", "tag": "前端架构", "description": "请作为资深前端架构师，为我评估当前React项目的状态管理方案，并对比Zustand与Redux在当前场景下的优劣。"},
+    {"id": "e_e2", "name": "Python 后端专家", "category": "engineering", "tag": "后端开发", "description": "作为拥有高并发处理经验的Python后端专家，请帮我审查这段FastAPI代码，并提供性能优化与安全加固建议。"},
+    {"id": "e_e3", "name": "DevOps 运维工程师", "category": "engineering", "tag": "DevOps", "description": "请扮演DevOps专家，为我的微服务架构编写一份标准的GitHub Actions CI/CD流水线配置文件。"},
+    {"id": "e_e4", "name": "数据库优化专家", "category": "engineering", "tag": "DBA", "description": "作为资深DBA，请帮我分析以下慢查询SQL语句，并给出加索引及重写查询的优化方案。"},
+    {"id": "e_e5", "name": "网络安全顾问", "category": "engineering", "tag": "安全", "description": "请作为网络安全顾问，为我的Web应用列出防范XSS、CSRF和SQL注入的具体代码层面防范措施。"},
+    {"id": "e_e6", "name": "系统架构师", "category": "engineering", "tag": "系统设计", "description": "请扮演分布式系统架构师，帮我设计一个支持百万日活的电商秒杀系统架构，包含缓存、队列和数据库的设计。"},
+
+    # 市场营销 (marketing)
+    {"id": "e_m1", "name": "爆款文案写手", "category": "marketing", "tag": "文案", "description": "请作为小红书/公众号爆款文案专家，根据我的产品特点，写出3个吸引眼球的标题和一篇高转化率的种草文案。"},
+    {"id": "e_m2", "name": "SEO 增长黑客", "category": "marketing", "tag": "SEO", "description": "作为SEO增长专家，请为我的独立站制定一份包含关键词研究、内容布局和外链建设的3个月增长计划。"},
+    {"id": "e_m3", "name": "社群运营操盘手", "category": "marketing", "tag": "社群", "description": "请扮演资深社群运营，帮我策划一个为期7天的微信群裂变拉新活动方案，包含诱饵设计和话术话术矩阵。"},
+    {"id": "e_m4", "name": "短视频编导", "category": "marketing", "tag": "视频营销", "description": "作为短视频爆款编导，请为我的产品写一个15秒的抖音/TikTok短视频脚本，包含画面分镜、旁白和背景音效提示。"},
+    {"id": "e_m5", "name": "公关传播专家", "category": "marketing", "tag": "PR", "description": "请作为资深PR专家，为我们即将发布的新产品撰写一份专业的新闻通稿，并列出适合的媒体投放矩阵。"},
+    {"id": "e_m6", "name": "营销活动策划", "category": "marketing", "tag": "活动策划", "description": "请扮演品牌营销策划，结合即将到来的节日，帮我设计一套完整的线上+线下整合营销活动方案及预算分配建议。"},
+
+    # 付费媒体 (paid)
+    {"id": "e_p1", "name": "信息流投放优化师", "category": "paid", "tag": "投放", "description": "请作为资深信息流优化师，帮我分析目前CTR低的原因，并给出修改落地页及调整定向人群的具体建议。"},
+    {"id": "e_p2", "name": "Google Ads 专家", "category": "paid", "tag": "SEM", "description": "作为Google Ads高级投手，请为我的B2B出海业务设计一套包含搜索广告、展示广告的账户结构及出价策略。"},
+    {"id": "e_p3", "name": "ROI 数据分析师", "category": "paid", "tag": "数据分析", "description": "请扮演广告ROI分析专家，根据我提供的消耗、转化和客单价数据，建立一个动态监控模型来预警亏损计划。"},
+    {"id": "e_p4", "name": "创意素材策划", "category": "paid", "tag": "素材", "description": "作为买量素材策划专家，请帮我构思3个跑量短视频的开头“黄金3秒”钩子，以提升广告停留率。"},
+    {"id": "e_p5", "name": "电商直通车车手", "category": "paid", "tag": "电商投放", "description": "请扮演资深淘宝/京东直通车车手，为我的新品打造一份包含测款、打爆和长线维护的7天螺旋起量投放计划。"},
+    {"id": "e_p6", "name": "媒体采买顾问", "category": "paid", "tag": "媒介", "description": "作为资深媒介采买，请为我制定一份品牌曝光投放策略，涵盖KOL/KOC组合建议、刊例砍价技巧及效果评估标准。"},
+
+    # 销售 (sales)
+    {"id": "e_s1", "name": "B2B 大客户销售", "category": "sales", "tag": "ToB销售", "description": "请作为拥有15年经验的B2B大客户销售总监，帮我撰写一封开发信（Cold Email），用于向世界500强企业的采购总监破冰。"},
+    {"id": "e_s2", "name": "销售话术培训师", "category": "sales", "tag": "话术", "description": "作为金牌销售培训师，请针对客户常说的“价格太贵了”、“我再考虑考虑”，为我的团队制定标准的反驳话术与逼单技巧。"},
+    {"id": "e_s3", "name": "SCRM 私域销售", "category": "sales", "tag": "私域", "description": "请扮演私域转化专家，为我的高客单价产品设计一套从加微信、日常朋友圈剧本到最终一对一成交的完整SOP。"},
+    {"id": "e_s4", "name": "跨境电商销冠", "category": "sales", "tag": "跨境销售", "description": "作为亚马逊/独立站的资深卖家，请帮我优化产品Listing，包括标题埋词、五点描述(Bullet Points)和A+页面文案。"},
+    {"id": "e_s5", "name": "客户成功经理 (CSM)", "category": "sales", "tag": "客户成功", "description": "请扮演资深CSM，为SaaS产品设计一套客户Onboarding（引导激活）流程，以降低首月流失率并促进客户续费。"},
+    {"id": "e_s6", "name": "销售团队管理专家", "category": "sales", "tag": "销售管理", "description": "作为销售VP，请为我制定一份兼顾公平与狼性的销售薪酬绩效考核方案，包含底薪、提成阶梯及销冠激励机制。"},
+]
+
+@app.get("/api/experts")
+async def get_experts():
+    categories = [
+        {"key": "all", "label": "全部"},
+        {"key": "design", "label": "设计", "count": 6},
+        {"key": "engineering", "label": "工程技术", "count": 6},
+        {"key": "marketing", "label": "市场营销", "count": 6},
+        {"key": "paid", "label": "付费媒体", "count": 6},
+        {"key": "sales", "label": "销售", "count": 6},
+    ]
+    return {
+        "categories": categories,
+        "experts": _MOCK_EXPERTS
+    }
+
+
+# ---------------------------------------------------------------------------
 # Skills & Tools endpoints
 # ---------------------------------------------------------------------------
 
@@ -1895,6 +2838,36 @@ async def get_skills():
     return skills
 
 
+@app.get("/api/skills/{skill_name:path}")
+async def get_skill_detail(skill_name: str):
+    from tools.skills_tool import skill_view, _is_skill_disabled
+    from hermes_cli.skills_config import get_disabled_skills
+    import json
+    
+    # Temporarily un-disable the skill if it's disabled so skill_view can read it
+    config = load_config()
+    disabled = get_disabled_skills(config)
+    was_disabled = skill_name in disabled
+    
+    # Actually skill_view doesn't accept a "skip_disabled" flag, but it reads from config.
+    # We can just mock _is_skill_disabled during the call.
+    import unittest.mock
+    with unittest.mock.patch("tools.skills_tool._is_skill_disabled", return_value=False):
+        result_str = skill_view(skill_name)
+        
+    try:
+        result = json.loads(result_str)
+        if not result.get("success"):
+            raise HTTPException(status_code=404, detail=result.get("error", "Skill not found"))
+        
+        # Add enabled status
+        result["enabled"] = not was_disabled
+        
+        return result
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Invalid response from skill_view")
+
+
 @app.put("/api/skills/toggle")
 async def toggle_skill(body: SkillToggle):
     from hermes_cli.skills_config import get_disabled_skills, save_disabled_skills
@@ -1906,6 +2879,115 @@ async def toggle_skill(body: SkillToggle):
         disabled.add(body.name)
     save_disabled_skills(config, disabled)
     return {"ok": True, "name": body.name, "enabled": body.enabled}
+
+
+# ---------------------------------------------------------------------------
+# MCP Endpoints
+# ---------------------------------------------------------------------------
+
+class McpToggle(BaseModel):
+    name: str
+    enabled: bool
+
+class McpRawUpdate(BaseModel):
+    json_text: str
+
+@app.get("/api/mcp")
+async def get_mcp_servers():
+    config = load_config()
+    servers = config.get("mcp_servers", {})
+    
+    # Let's get tools info from the backend. We'll use the _probe_single_server
+    # from mcp_config to check if we want, but that's slow. We can just return
+    # what's in the config, and the frontend will display it.
+    
+    config_path = get_config_path()
+    
+    return {
+        "servers": servers,
+        "config_path": str(config_path)
+    }
+
+@app.put("/api/mcp/toggle")
+async def toggle_mcp_server(body: McpToggle):
+    config = load_config()
+    servers = config.get("mcp_servers", {})
+    if body.name not in servers:
+        raise HTTPException(status_code=404, detail="MCP Server not found")
+        
+    server_config = servers[body.name]
+    tool_names = []
+    
+    if body.enabled:
+        from hermes_cli.mcp_config import _probe_single_server, _unwrap_exception_group
+        try:
+            tools = await asyncio.get_event_loop().run_in_executor(
+                None, _probe_single_server, body.name, server_config
+            )
+            tool_names = [t[0] for t in tools]
+        except Exception as e:
+            err = _unwrap_exception_group(e) if hasattr(e, 'exceptions') else e
+            raise HTTPException(status_code=400, detail=f"服务连接失败: {str(err)}")
+            
+    # Instead of 'disabled', hermes_cli uses 'enabled'
+    servers[body.name]["enabled"] = body.enabled
+    config["mcp_servers"] = servers
+    save_config(config)
+    return {"ok": True, "name": body.name, "enabled": body.enabled, "tools": tool_names}
+
+@app.get("/api/mcp/{server_name}/tools")
+async def get_mcp_server_tools(server_name: str):
+    config = load_config()
+    servers = config.get("mcp_servers", {})
+    if server_name not in servers:
+        raise HTTPException(status_code=404, detail="MCP Server not found")
+    
+    server_config = servers[server_name]
+    from hermes_cli.mcp_config import _probe_single_server, _unwrap_exception_group
+    try:
+        tools = await asyncio.get_event_loop().run_in_executor(
+            None, _probe_single_server, server_name, server_config
+        )
+        return {"ok": True, "tools": [t[0] for t in tools]}
+    except Exception as e:
+        err = _unwrap_exception_group(e) if hasattr(e, 'exceptions') else e
+        raise HTTPException(status_code=400, detail=f"服务连接失败: {str(err)}")
+
+@app.put("/api/mcp/raw")
+async def update_mcp_raw(body: McpRawUpdate):
+    try:
+        parsed = json.loads(body.json_text)
+        if "mcpServers" not in parsed:
+            raise HTTPException(status_code=400, detail="Missing 'mcpServers' root key")
+            
+        config = load_config()
+        # Convert 'disabled: true' (Cursor/Claude format) back to 'enabled: false' for Hermes
+        servers = parsed["mcpServers"]
+        for k, v in servers.items():
+            if "disabled" in v:
+                v["enabled"] = not v["disabled"]
+                del v["disabled"]
+        
+        config["mcp_servers"] = servers
+        save_config(config)
+        return {"ok": True}
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+
+@app.delete("/api/mcp/{server_name}")
+async def delete_mcp_server(server_name: str):
+    config = load_config()
+    servers = config.get("mcp_servers", {})
+    if server_name in servers:
+        del servers[server_name]
+        if not servers:
+            config.pop("mcp_servers", None)
+        else:
+            config["mcp_servers"] = servers
+        save_config(config)
+        return {"ok": True}
+    raise HTTPException(status_code=404, detail="MCP Server not found")
 
 
 @app.get("/api/tools/toolsets")
@@ -2056,6 +3138,8 @@ def mount_spa(application: FastAPI):
 
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str):
+        if full_path.startswith("api/"):
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
         file_path = WEB_DIST / full_path
         # Prevent path traversal via url-encoded sequences (%2e%2e/)
         if (
